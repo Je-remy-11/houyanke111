@@ -63,27 +63,27 @@ module.exports = function(info,socket,callindex,gamectr){
         switch(cmd){
             case "createroom_req":
                 that._gamesctr.create_room(data,that,function(err,result){
-                    if(err!=0){
-                        console.log("create_room err:"+ err)
+                    if(err && err.code !== 0){
+                        console.log("create_room err:", err)
+                        _notify("createroom_resp",err.code,err.data || {},callindex)
                     }else{
                         that._room = result.room
-                        console.log("create_room:"+ result)
+                        console.log("create_room success, room_id:", result.data.roomid)
+                        _notify("createroom_resp",0,result.data,callindex)
                     }
-                   
-                    _notify("createroom_resp",err,result.data,callindex)
                 })
 
                 break;
                 case "joinroom_req":
                    
-                    that._gamesctr.jion_room(req.data,that,function(err,result){
-                        if(err){
-                            console.log("joinroom_req err"+ err)
-                            _notify("joinroom_resp",err,null,callindex)
+                    that._gamesctr.join_room(req.data,that,function(err,result){
+                        if(err && err.code !== 0){
+                            console.log("joinroom_req err:", err)
+                            _notify("joinroom_resp",err.code,result ? result.data : null,callindex)
                         }else{
                             //加入房间成功
                             that._room = result.room
-                            _notify("joinroom_resp",err,result.data,callindex)
+                            _notify("joinroom_resp",0,result.data,callindex)
                         }
 
                     })

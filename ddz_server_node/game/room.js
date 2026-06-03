@@ -116,7 +116,7 @@ module.exports = function(roominfo,player){
         }
     }
 
-    that.jion_player = function(player){
+    that.join_player = function(player){
         if(player){
             player.seatindex = getSeatIndex(that._player_list) 
             playerInfo={

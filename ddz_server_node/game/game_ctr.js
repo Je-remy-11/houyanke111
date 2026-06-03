@@ -5,61 +5,149 @@ const config = require("../defines.js")
 var _player_list = []
 var _room_info = []
 
-exports.create_player = function(playInfo,socket,callindex){
-    var player = Player(playInfo,socket,callindex,this)
+/**
+ * 标准错误码对象
+ * @readonly
+ * @enum {Object}
+ */
+const ErrCode = {
+    SUCCESS:        { code: 0,  msg: "success" },
+    GOLD_NOT_ENOUGH:{ code: -1, msg: "gold not enough" },
+    ROOM_NOT_FOUND: { code: -2, msg: "room not found" },
+    INVALID_PARAM:  { code: -3, msg: "invalid parameter" },
+    ROOM_FULL:      { code: -4, msg: "room is full" },
+}
+
+exports.create_player = function(playInfo, socket, callindex) {
+    var player = Player(playInfo, socket, callindex, this)
     _player_list.push(player)
 }
 
-exports.create_room = function(roomInfo,own_player,callback){
-    var room = Room(roomInfo,own_player)
+/**
+ * 创建房间 - 采用"校验→扣费→创建"的事务性流程
+ * @param {Object} roomInfo - 房间配置信息
+ * @param {Object} own_player - 房主玩家对象
+ * @param {Function} callback - 回调函数，接收 (err, result)
+ */
+exports.create_room = function(roomInfo, own_player, callback) {
+    // === 1. 参数防御性校验 ===
+    if (!roomInfo || !own_player) {
+        console.error("[create_room] Invalid parameters: roomInfo=%j, own_player=%s",
+            roomInfo, own_player ? own_player._accountID : "null")
+        if (callback) {
+            callback(ErrCode.INVALID_PARAM, null)
+        }
+        return
+    }
+
+    if (!roomInfo.rate || !config.createRoomConfig[roomInfo.rate]) {
+        console.error("[create_room] Invalid rate: %s", roomInfo.rate)
+        if (callback) {
+            callback(ErrCode.INVALID_PARAM, null)
+        }
+        return
+    }
+
+    // === 2. 前置校验：金币是否足够 ===
+    var needGold = config.createRoomConfig[roomInfo.rate].needCostGold
+    console.log("[create_room] Player=%s, needGold=%d, ownGold=%d",
+        own_player._accountID, needGold, own_player._gold)
+
+    if (own_player._gold < needGold) {
+        console.warn("[create_room] Gold not enough. player=%s, gold=%d, need=%d",
+            own_player._accountID, own_player._gold, needGold)
+        if (callback) {
+            callback(ErrCode.GOLD_NOT_ENOUGH, null)
+        }
+        return
+    }
+
+    // === 3. 扣费（原子操作，在事务性系统中应在此处加分布式锁） ===
+    own_player._gold -= needGold
+    console.log("[create_room] Gold deducted. player=%s, deducted=%d, remain=%d",
+        own_player._accountID, needGold, own_player._gold)
+
+    // === 4. 创建房间并加入全局列表 ===
+    var room = Room(roomInfo, own_player)
     _room_info.push(room)
-    //检测用户是否能创建房间
-    //检查金币数量是否足够
-    var needglobal = config.createRoomConfig[roomInfo.rate].needCostGold
-    console.log("create room needglobal:"+needglobal)
-    
-    if(own_player._gold < needglobal){
-        callback(-1,{}) 
-        return 
-    }
-    room.jion_player(own_player)
-    if (callback){
-        callback(0,{
-                    room:room,
-                    data:{
-                           roomid:room.room_id,
-                           bottom:room.bottom,
-                           rate:roomInfo.rate
-                         }
-                   })
-        }
+    console.log("[create_room] Room created. room_id=%s, _room_info.length=%d",
+        room.room_id, _room_info.length)
 
+    // === 5. 房主加入房间 ===
+    room.join_player(own_player)
+
+    // === 6. 成功回调 ===
+    if (callback) {
+        callback(ErrCode.SUCCESS, {
+            room: room,
+            data: {
+                roomid: room.room_id,
+                bottom: room.bottom,
+                rate: roomInfo.rate,
+                gold: own_player._gold,
+            }
+        })
+    }
 }
-//notify{"type":"joinroom_resp","result":null,"data":{"data":{"roomid":"714950","gold":100}},"callBackIndex":3}
-exports.jion_room = function(data,player,callback){
-    //console.log("jion_room AA"+data.roomid)
-    for(var i=0;i<_room_info.length;++i){
-        //console.log("_room_info[i] BB:"+_room_info[i].room_id)
-        if(_room_info[i].room_id === data.roomid){
-            //console.log("----jion_room sucess roomid:"+data.roomid)
-            _room_info[i].jion_player(player) 
-            if(callback){
-                resp = {
-                    room:_room_info[i],
-                    data:{
-                          roomid:_room_info[i].room_id,
-                          bottom:_room_info[i].bottom,
-                          rate:_room_info[i].rate,
-                          gold:_room_info[i].gold,
-                        }
+
+/**
+ * 加入房间
+ * @param {Object} data - 请求数据，包含 roomid
+ * @param {Object} player - 玩家对象
+ * @param {Function} callback - 回调函数，接收 (err, result)
+ */
+exports.join_room = function(data, player, callback) {
+    // === 1. 参数防御性校验 ===
+    if (!data || !data.roomid) {
+        console.error("[join_room] Invalid data: data=%j", data)
+        if (callback) {
+            callback(ErrCode.INVALID_PARAM, null)
+        }
+        return
+    }
+
+    if (!player) {
+        console.error("[join_room] Invalid player: null")
+        if (callback) {
+            callback(ErrCode.INVALID_PARAM, null)
+        }
+        return
+    }
+
+    var roomid = String(data.roomid)
+    console.log("[join_room] Player=%s trying to join room=%s",
+        player._accountID, roomid)
+
+    // === 2. 查找房间 ===
+    for (var i = 0; i < _room_info.length; ++i) {
+        if (String(_room_info[i].room_id) === roomid) {
+            // 找到房间
+            _room_info[i].join_player(player)
+
+            if (callback) {
+                var resp = {
+                    room: _room_info[i],
+                    data: {
+                        roomid: _room_info[i].room_id,
+                        bottom: _room_info[i].bottom,
+                        rate: _room_info[i].rate,
+                        gold: _room_info[i].gold,
+                    }
                 }
-                callback(0,resp)
-                return
-            } 
+                callback(ErrCode.SUCCESS, resp)
+            }
+            return
         }
     }
 
-    if(callback){
-        callback("no found room:"+data.roomid)
+    // === 3. 房间未找到 ===
+    console.warn("[join_room] Room not found. roomid=%s", roomid)
+    if (callback) {
+        callback(ErrCode.ROOM_NOT_FOUND, {
+            data: {
+                roomid: roomid,
+                msg: "room not found: " + roomid,
+            }
+        })
     }
-} 
+}
