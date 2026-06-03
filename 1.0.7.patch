@@ -1,0 +1,646 @@
+diff --git a/ddz_server_node/game/game_ctr.js b/ddz_server_node/game/game_ctr.js
+index 3931d6c..ecdea60 100644
+--- a/ddz_server_node/game/game_ctr.js
++++ b/ddz_server_node/game/game_ctr.js
+@@ -5,61 +5,213 @@ const config = require("../defines.js")
+ var _player_list = []
+ var _room_info = []
+ 
+-exports.create_player = function(playInfo,socket,callindex){
+-    var player = Player(playInfo,socket,callindex,this)
++var ERROR_CODE = {
++    INVALID_ROOM_INFO: -1001,
++    INVALID_PLAYER: -1002,
++    INSUFFICIENT_GOLD: -1003,
++    ROOM_CREATE_FAILED: -1004,
++    INVALID_JOIN_DATA: -1005,
++    ROOM_NOT_FOUND: -1006,
++    ROOM_FULL: -1007,
++}
++
++var createError = function(code, msg, extra){
++    var error = {
++        code: code,
++        msg: msg,
++    }
++
++    if (extra && typeof extra === "object") {
++        for (var key in extra) {
++            error[key] = extra[key]
++        }
++    }
++
++    return error
++}
++
++var getRoomConfig = function(rate){
++    if (rate === undefined || rate === null) {
++        return null
++    }
++
++    return config.createRoomConfig[String(rate)] || null
++}
++
++var findRoomById = function(roomid){
++    for (var i = 0; i < _room_info.length; ++i) {
++        if (_room_info[i].room_id === roomid) {
++            return _room_info[i]
++        }
++    }
++
++    return null
++}
++
++var removeRoomById = function(roomid){
++    for (var i = 0; i < _room_info.length; ++i) {
++        if (_room_info[i].room_id === roomid) {
++            _room_info.splice(i, 1)
++            return true
++        }
++    }
++
++    return false
++}
++
++var buildRoomResponse = function(room){
++    var data = {
++        roomid: room.room_id,
++        bottom: room.bottom,
++        rate: room.rate,
++    }
++
++    if (typeof room.gold !== "undefined") {
++        data.gold = room.gold
++    }
++
++    return {
++        room: room,
++        data: data,
++    }
++}
++
++var isPlayerAlreadyInRoom = function(room, player){
++    if (!room || !room._player_list || !player) {
++        return false
++    }
++
++    for (var i = 0; i < room._player_list.length; ++i) {
++        if (room._player_list[i] && room._player_list[i]._accountID === player._accountID) {
++            return true
++        }
++    }
++
++    return false
++}
++
++exports.create_player = function(playInfo, socket, callindex){
++    var player = Player(playInfo, socket, callindex, this)
+     _player_list.push(player)
+ }
+ 
+-exports.create_room = function(roomInfo,own_player,callback){
+-    var room = Room(roomInfo,own_player)
+-    _room_info.push(room)
+-    //检测用户是否能创建房间
+-    //检查金币数量是否足够
+-    var needglobal = config.createRoomConfig[roomInfo.rate].needCostGold
+-    console.log("create room needglobal:"+needglobal)
+-    
+-    if(own_player._gold < needglobal){
+-        callback(-1,{}) 
+-        return 
+-    }
+-    room.jion_player(own_player)
+-    if (callback){
+-        callback(0,{
+-                    room:room,
+-                    data:{
+-                           roomid:room.room_id,
+-                           bottom:room.bottom,
+-                           rate:roomInfo.rate
+-                         }
+-                   })
++exports.create_room = function(roomInfo, own_player, callback){
++    var roomConfig = roomInfo ? getRoomConfig(roomInfo.rate) : null
++
++    if (!own_player) {
++        if (callback) {
++            callback(createError(ERROR_CODE.INVALID_PLAYER, "create room failed: player is empty"), null)
++        }
++        return
++    }
++
++    if (!roomInfo || !roomConfig) {
++        if (callback) {
++            callback(createError(ERROR_CODE.INVALID_ROOM_INFO, "create room failed: invalid room config", { rate: roomInfo && roomInfo.rate }), null)
++        }
++        return
++    }
++
++    var needGold = roomConfig.needCostGold
++    console.log("create room needglobal:" + needGold)
++
++    if (typeof own_player._gold !== "number" || own_player._gold < needGold) {
++        if (callback) {
++            callback(createError(ERROR_CODE.INSUFFICIENT_GOLD, "create room failed: gold not enough", { needGold: needGold, currentGold: own_player._gold }), null)
++        }
++        return
++    }
++
++    var room = null
++    var originalGold = own_player._gold
++
++    try {
++        own_player._gold -= needGold
++        room = Room(roomInfo, own_player)
++
++        if (!room || typeof room.jion_player !== "function") {
++            throw new Error("invalid room instance")
++        }
++
++        room.jion_player(own_player)
++        _room_info.push(room)
++
++        if (callback) {
++            callback(null, buildRoomResponse(room))
++        }
++    } catch (err) {
++        own_player._gold = originalGold
++
++        if (room && room.room_id) {
++            removeRoomById(room.room_id)
++        }
++
++        if (callback) {
++            callback(createError(ERROR_CODE.ROOM_CREATE_FAILED, "create room failed: " + err.message), null)
++        }
++    }
++}
++
++exports.join_room = function(data, player, callback){
++    if (!player) {
++        if (callback) {
++            callback(createError(ERROR_CODE.INVALID_PLAYER, "join room failed: player is empty"), null)
++        }
++        return
++    }
++
++    if (!data || typeof data.roomid !== "string" || data.roomid.trim() === "") {
++        if (callback) {
++            callback(createError(ERROR_CODE.INVALID_JOIN_DATA, "join room failed: roomid is empty"), null)
++        }
++        return
++    }
++
++    var roomid = data.roomid.trim()
++    var room = findRoomById(roomid)
++
++    if (!room) {
++        if (callback) {
++            callback(createError(ERROR_CODE.ROOM_NOT_FOUND, "join room failed: room " + roomid + " not found", { roomid: roomid }), null)
+         }
++        return
++    }
+ 
++    if (isPlayerAlreadyInRoom(room, player)) {
++        if (callback) {
++            callback(null, buildRoomResponse(room))
++        }
++        return
++    }
++
++    if (room._player_list && room._player_list.length >= config.roomFullPlayerCount) {
++        if (callback) {
++            callback(createError(ERROR_CODE.ROOM_FULL, "join room failed: room is full", { roomid: roomid }), null)
++        }
++        return
++    }
++
++    try {
++        room.jion_player(player)
++        if (callback) {
++            callback(null, buildRoomResponse(room))
++        }
++    } catch (err) {
++        if (callback) {
++            callback(createError(ERROR_CODE.INVALID_JOIN_DATA, "join room failed: " + err.message, { roomid: roomid }), null)
++        }
++    }
++}
++
++exports.jion_room = exports.join_room
++
++exports.__getRoomInfo = function(){
++    return _room_info.slice()
+ }
+-//notify{"type":"joinroom_resp","result":null,"data":{"data":{"roomid":"714950","gold":100}},"callBackIndex":3}
+-exports.jion_room = function(data,player,callback){
+-    //console.log("jion_room AA"+data.roomid)
+-    for(var i=0;i<_room_info.length;++i){
+-        //console.log("_room_info[i] BB:"+_room_info[i].room_id)
+-        if(_room_info[i].room_id === data.roomid){
+-            //console.log("----jion_room sucess roomid:"+data.roomid)
+-            _room_info[i].jion_player(player) 
+-            if(callback){
+-                resp = {
+-                    room:_room_info[i],
+-                    data:{
+-                          roomid:_room_info[i].room_id,
+-                          bottom:_room_info[i].bottom,
+-                          rate:_room_info[i].rate,
+-                          gold:_room_info[i].gold,
+-                        }
+-                }
+-                callback(0,resp)
+-                return
+-            } 
+-        }
+-    }
+-
+-    if(callback){
+-        callback("no found room:"+data.roomid)
+-    }
+-} 
++
++exports.__resetForTests = function(){
++    _player_list = []
++    _room_info = []
++}
++
++exports.__ERROR_CODE = ERROR_CODE
+diff --git a/ddz_server_node/game/player.js b/ddz_server_node/game/player.js
+index b416572..fbd2fbe 100644
+--- a/ddz_server_node/game/player.js
++++ b/ddz_server_node/game/player.js
+@@ -1,219 +1,230 @@
+-module.exports = function(info,socket,callindex,gamectr){
+-   //console.log("playerinfo:"+ JSON.stringify(info))
++module.exports = function(info, socket, callindex, gamectr){
+    var that = {}
+-   that._nickName = info.nick_name;    //用户昵称
+-   that._accountID = info.account_id;  //用户账号
+-   that._avatarUrl = info.avatar_url;  //头像
+-   that._gold = info.gold_count;       //当前金币
++   that._nickName = info.nick_name
++   that._accountID = info.account_id
++   that._avatarUrl = info.avatar_url
++   that._gold = info.gold_count
+    that._socket = socket
+    that._gamesctr = gamectr
+-   that._room = undefined //所在房间的引用
+-   that._seatindex = 0   //在房间的位置
+-   that._isready = false //当前在房间的状态 是否点击了准备按钮
+-   that._cards = []      //当前手上的牌
+-   //内部使用的发送数据函数
+-   const _notify = function (type, result ,data, callBackIndex) {
+-    console.log('notify =' + JSON.stringify(data));
+-    that._socket.emit('notify', {
++   that._room = undefined
++   that._seatindex = 0
++   that._isready = false
++   that._cards = []
++
++   const _notify = function (type, result, data, callBackIndex) {
++    console.log("notify =" + JSON.stringify(data))
++    that._socket.emit("notify", {
+         type: type,
+-        result:result,
++        result: result,
+         data: data,
+         callBackIndex: callBackIndex
+-    });
+-};
+-   
++    })
++   }
++
++   const _normalizeError = function(err){
++        if (!err) {
++            return null
++        }
++
++        if (typeof err === "object" && typeof err.code === "number") {
++            return err
++        }
++
++        if (typeof err === "number") {
++            return {
++                code: err,
++                msg: ""
++            }
++        }
++
++        return {
++            code: -1,
++            msg: String(err)
++        }
++   }
++
++   const _buildNotifyData = function(error, data){
++        if (!error) {
++            return data
++        }
++
++        var payload = data
++        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
++            payload = {}
++        }
++
++        payload.error = error
++        return payload
++   }
+ 
+-   //通知客户端登录成功，返回数据
+-   _notify("login_resp",0,{goldcount:that._gold},callindex)
++   _notify("login_resp", 0, {goldcount: that._gold}, callindex)
+ 
+-   that._socket.on("disconnect",function(){
++   that._socket.on("disconnect", function(){
+         console.log("player disconnect")
+-        if(that._room){
++        if (that._room) {
+             that._room.playerOffLine(that)
+         }
+    })
+ 
+-   //删除玩家出过的牌
+    that.removePushCards = function(remve_cards){
+-        if(remve_cards.length==0){
+-            return 
++        if (remve_cards.length == 0) {
++            return
+         }
+ 
+-        for(var i=0;i<remve_cards.length;i++){
++        for (var i = 0; i < remve_cards.length; i++) {
+             var rcard = remve_cards[i]
+-            if(rcard==null){
++            if (rcard == null) {
+                 continue
+-            } 
+-            
+-            for(var j=0;j<that._cards.length;j++){
+-                if(rcard.cardid==that._cards[j].cardid){
+-                    that._cards.splice(j,1)
++            }
++
++            for (var j = 0; j < that._cards.length; j++) {
++                if (rcard.cardid == that._cards[j].cardid) {
++                    that._cards.splice(j, 1)
+                 }
+             }
+-           
+         }
+    }
+ 
+-   //data分3个部分 cmd,{data},callindex
+-   that._socket.on("notify",function(req){
++   that._socket.on("notify", function(req){
+         var cmd = req.cmd
+         var data = req.data
+         var callindex = req.callindex
+         console.log("_notify" + JSON.stringify(req))
+         switch(cmd){
+             case "createroom_req":
+-                that._gamesctr.create_room(data,that,function(err,result){
+-                    if(err!=0){
+-                        console.log("create_room err:"+ err)
+-                    }else{
++                that._gamesctr.create_room(data, that, function(err, result){
++                    var error = _normalizeError(err)
++                    if (error) {
++                        console.log("create_room err:" + JSON.stringify(error))
++                    } else {
+                         that._room = result.room
+-                        console.log("create_room:"+ result)
++                        console.log("create_room:" + JSON.stringify(result.data))
+                     }
+-                   
+-                    _notify("createroom_resp",err,result.data,callindex)
++
++                    _notify("createroom_resp", error ? error.code : 0, _buildNotifyData(error, result ? result.data : null), callindex)
+                 })
++                break
++            case "joinroom_req":
++                that._gamesctr.join_room(data, that, function(err, result){
++                    var error = _normalizeError(err)
++                    if (error) {
++                        console.log("joinroom_req err" + JSON.stringify(error))
++                    } else {
++                        that._room = result.room
++                    }
+ 
+-                break;
+-                case "joinroom_req":
+-                   
+-                    that._gamesctr.jion_room(req.data,that,function(err,result){
+-                        if(err){
+-                            console.log("joinroom_req err"+ err)
+-                            _notify("joinroom_resp",err,null,callindex)
+-                        }else{
+-                            //加入房间成功
+-                            that._room = result.room
+-                            _notify("joinroom_resp",err,result.data,callindex)
++                    _notify("joinroom_resp", error ? error.code : 0, _buildNotifyData(error, result ? result.data : null), callindex)
++                })
++                break
++            case "enterroom_req":
++                if (that._room) {
++                    that._room.enter_room(that, function(err, result){
++                        if (err != 0) {
++                            _notify("enter_room_resp", err, {}, callindex)
++                        } else {
++                            that._seatindex = result.seatindex
++                            _notify("enter_room_resp", err, result, callindex)
+                         }
+-
+                     })
+-                    break
+-                    case "enterroom_req":
+-                        if(that._room) {
+-                            that._room.enter_room(that,function(err,result){
+-                                if(err!=0){
+-                                    _notify("enter_room_resp",err,{},callindex)
+-                                }else{
+-                                    //enterroom成功
+-                                    that._seatindex =  result.seatindex
+-                                    _notify("enter_room_resp",err,result,callindex)
+-                                }
+-                              
+-                            })
+-                           
+-                        }else{
+-                            console.log("that._room is null")
++                } else {
++                    console.log("that._room is null")
++                }
++                break
++            case "player_ready_notify":
++                if (that._room) {
++                    that._isready = true
++                    that._room.playerReady(that)
++                }
++                break
++            case "player_start_notify":
++                if (that._room) {
++                    that._room.playerStart(that, function(err, result){
++                        if (err) {
++                            console.log("player_start_notify err" + err)
++                            _notify("player_start_notify", err, null, callindex)
++                        } else {
++                            _notify("player_start_notify", err, result.data, callindex)
+                         }
+-                        
+-                        break
+-                     case "player_ready_notify":   //玩家准备消息通知
+-                         if(that._room){
+-                            that._isready = true 
+-                            that._room.playerReady(that)
+-                         }
+-                         break 
+-                     case "player_start_notify": //客户端:房主发送开始游戏消息
+-                           if(that._room){
+-                            that._room.playerStart(that,function(err,result){
+-                                if(err){
+-                                    console.log("player_start_notify err"+ err)
+-                                    _notify("player_start_notify",err,null,callindex)
+-                                }else{ 
+-                                    //加入房间成功
+-                                    
+-                                    _notify("player_start_notify",err,result.data,callindex)
+-                                }
+-        
+-                            })
+-                           }
+-                           break    
+-                      case "player_rob_notify":  //客户端发送抢地主消息
+-                           if(that._room){
+-                            that._room.playerRobmaster(that,data)
+-                           }
+-                           break 
+-                       case "chu_bu_card_req":   //客户端发送出牌消息
+-                            if(that._room){
+-                                that._room.playerBuChuCard(that,data)
+-                            }
+-                           break   
+-                       case "chu_card_req":
+-                            if(that._room){
+-                               
+-                                console.log("that._room")
+-                                that._room.playerChuCard(that,data,function(err,result){
+-                                    if(err){
+-                                      console.log("playerChuCard cb err:"+err+" "+result)
+-                                      _notify("chu_card_res",err,result.data,callindex)
+-                                                
+-                                    }
+-                                     _notify("chu_card_res",err,result.data,callindex)
+-                                })
+-                            }
+-                           break         
++                    })
++                }
++                break
++            case "player_rob_notify":
++                if (that._room) {
++                    that._room.playerRobmaster(that, data)
++                }
++                break
++            case "chu_bu_card_req":
++                if (that._room) {
++                    that._room.playerBuChuCard(that, data)
++                }
++                break
++            case "chu_card_req":
++                if (that._room) {
++                    console.log("that._room")
++                    that._room.playerChuCard(that, data, function(err, result){
++                        if (err) {
++                            console.log("playerChuCard cb err:" + err + " " + result)
++                            _notify("chu_card_res", err, result.data, callindex)
++                        }
++                        _notify("chu_card_res", err, result.data, callindex)
++                    })
++                }
++                break
+             default:
+-                break;    
++                break
+         }
+    })
+ 
+    that.sendPlayerJoinRoom = function(data){
+     console.log("player join room notify" + JSON.stringify(data))
+-     _notify("player_joinroom_notify",0,data,0)
++     _notify("player_joinroom_notify", 0, data, 0)
+    }
+ 
+-   //发送有玩家准备好消息
+    that.sendplayerReady = function(data){
+-       //console.log("sendplayerReady accountid:"+data)
+-       _notify("player_ready_notify",0,data,0)
++       _notify("player_ready_notify", 0, data, 0)
+    }
+ 
+    that.gameStart = function(){
+-       //console.log("player gameStart")
+-       _notify("gameStart_notify",0,{},0)
++       _notify("gameStart_notify", 0, {}, 0)
+    }
+ 
+    that.sendPlayerChangeManage = function(data){
+-         console.log("sendPlayerChangeManage: account:"+data)
+-         _notify("changehousemanage_notify",0,data,0)
++         console.log("sendPlayerChangeManage: account:" + data)
++         _notify("changehousemanage_notify", 0, data, 0)
+    }
+ 
+    that.sendCard = function(data){
+     that._cards = data
+-    _notify("pushcard_notify",0,data,0)
++    _notify("pushcard_notify", 0, data, 0)
+    }
+-   
+-   //发送谁可以抢地主
++
+     that.SendCanRob = function(data){
+-        console.log("SendCanRob"+data)
+-        _notify("canrob_notify",0,data,0)
++        console.log("SendCanRob" + data)
++        _notify("canrob_notify", 0, data, 0)
+     }
+ 
+-    //通知抢地主状态
+     that.sendRobState = function(data){
+-        _notify("canrob_state_notify",0,data,0)
++        _notify("canrob_state_notify", 0, data, 0)
+     }
+ 
+-    //发送当前地主是谁
+     that.SendChangeMaster = function(data){
+-        _notify("change_master_notify",0,data,0)
++        _notify("change_master_notify", 0, data, 0)
+     }
+ 
+-    //发送给客户端:显示底牌
+     that.SendShowBottomCard = function(data){
+-        _notify("change_showcard_notify",0,data,0)
++        _notify("change_showcard_notify", 0, data, 0)
+     }
+ 
+     that.SendChuCard = function(data){
+-        _notify("can_chu_card_notify",0,data,0)
++        _notify("can_chu_card_notify", 0, data, 0)
+     }
+ 
+     that.sendRoomState = function(data){
+-        _notify("room_state_notify",0,data,0)
++        _notify("room_state_notify", 0, data, 0)
+     }
+ 
+-    //通知：其他玩家出牌广播
+     that.SendOtherChuCard = function(data){
+-        _notify("other_chucard_notify",0,data,0)
++        _notify("other_chucard_notify", 0, data, 0)
+     }
+     return that
+ }
