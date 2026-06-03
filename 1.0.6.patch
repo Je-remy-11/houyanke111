@@ -1,0 +1,672 @@
+diff --git a/1.0.6.patch b/1.0.6.patch
+new file mode 100644
+index 0000000..e69de29
+diff --git a/BUG_ANALYSIS_REPORT.md b/BUG_ANALYSIS_REPORT.md
+new file mode 100644
+index 0000000..8daffbe
+--- /dev/null
++++ b/BUG_ANALYSIS_REPORT.md
+@@ -0,0 +1,231 @@
++# 斗地主游戏房间管理模块 - Bug分析与修复报告
++
++## 1. Bug定位与影响分析
++
++### Bug 1: 金币不足但房间已先创建（幽灵房间）
++
++**代码位置：** `create_room` 函数 (原代码第 12-27 行)
++
++```javascript
++exports.create_room = function(roomInfo,own_player,callback){
++    var room = Room(roomInfo,own_player)
++    _room_info.push(room)  // 先创建房间
++    var needglobal = config.createRoomConfig[roomInfo.rate].needCostGold
++    if(own_player._gold < needglobal){  // 后检查金币
++        callback(-1,{})
++        return
++    }
++    // ...
++}
++```
++
++**复现场景：** 玩家携带金币不足调用 `create_room` 时。
++
++**影响分析：** 
++- 房间被加入 `_room_info` 数组，但从未被使用
++- 导致内存泄漏（幽灵房间）
++- 房间会短暂出现在房间列表中，其他玩家尝试加入时会失败
++
++---
++
++### Bug 2: 回调参数格式不一致（客户端崩溃）
++
++**代码位置：** `create_room` 和 `jion_room` 函数
++
++- `create_room` 回调：`callback(-1, {})` 或 `callback(0, { room: ..., data: ... })`
++- `jion_room` 成功回调：`callback(0, resp)`
++- `jion_room` 失败回调：`callback("no found room:xxx")`
++
++**复现场景：** 
++- 客户端收到字符串类型的错误消息而不是数字错误码
++- 客户端按对象格式解析回调时收到字符串
++
++**影响分析：** 
++- 客户端解析失败导致崩溃
++- 错误处理逻辑混乱
++
++---
++
++### Bug 3: 函数名拼写错误
++
++**代码位置：** 
++- 函数定义：`exports.jion_room` (应为 `join_room`)
++- 房间方法调用：`room.jion_player` (应为 `join_player`)
++
++**复现场景：** 任何调用 `join_room` 的地方都会找不到函数。
++
++**影响分析：** 
++- 代码可读性差
++- 容易引发调用错误
++
++---
++
++### Bug 4: 缺少参数校验
++
++**代码位置：** 所有公共函数都缺少参数校验
++
++**复现场景：** 
++- 传入 `null` 或 `undefined` 的 `player`
++- 传入缺少 `roomid` 的 `data`
++- 传入无效的 `roomInfo.rate`
++
++**影响分析：** 
++- 可能导致运行时异常
++- 无法优雅地处理错误输入
++
++---
++
++### Bug 5: 可能返回 undefined 的 gold 字段
++
++**代码位置：** `jion_room` 函数第 47 行
++
++```javascript
++gold:_room_info[i].gold,  // 房间可能没有 gold 属性
++```
++
++**复现场景：** 房间对象未初始化 `gold` 属性时。
++
++**影响分析：** 客户端收到 `undefined` 可能导致处理异常。
++
++---
++
++## 2. 根因分析与调试方法
++
++### 2.1 调试幽灵房间问题
++
++#### 添加的日志语句：
++
++```javascript
++console.log("[create_room] 开始创建房间，玩家金币:", own_player._gold)
++console.log("[create_room] 所需金币:", needglobal)
++console.log("[create_room] 房间创建成功，room_id:", room.room_id)
++console.log("[create_room] 当前房间总数:", _room_info.length)
++console.log("[create_room] 金币不足，拒绝创建，但房间已添加!")
++```
++
++#### 模拟高并发场景：
++
++```javascript
++// 并发测试脚本
++for (let i = 0; i < 100; i++) {
++    setTimeout(() => {
++        const poorPlayer = { _gold: 50 };
++        roomManager.create_room({ rate: 1 }, poorPlayer, (result) => {
++            console.log(`请求 ${i} 完成`);
++        });
++    }, i * 5);
++}
++
++// 定期检查房间数量
++setInterval(() => {
++    console.log("当前房间数量:", _room_info.length);
++}, 1000);
++```
++
++---
++
++### 2.2 调试回调参数类型不一致问题
++
++#### 使用 Node.js 调试工具：
++
++1. **启动调试器：**
++   ```bash
++   node inspect room_manager.js
++   ```
++
++2. **设置断点：**
++   ```javascript
++   // 在回调前添加断点
++   debugger;
++   callback(-1, {});
++   ```
++
++3. **使用 Chrome DevTools：**
++   ```bash
++   node --inspect-brk room_manager.js
++   ```
++   然后在 Chrome 中打开 `chrome://inspect`
++
++4. **检查调用栈和变量类型：**
++   - 查看 `callback` 的调用位置
++   - 验证传入参数的类型
++
++---
++
++## 3. 修复方案与代码实现
++
++修复后的代码见 `room_manager_fixed.js`。
++
++### 3.1 向后兼容性说明
++
++为了保持向后兼容，建议采用**兼容模式**：
++
++```javascript
++// 保留旧函数名作为别名
++exports.jion_room = exports.join_room;
++
++// 同时支持新旧回调格式（可选）
++function callbackWrapper(callback, result) {
++    if (typeof callback === 'function') {
++        // 新格式：统一对象
++        callback(result);
++        // 旧格式：两个参数（可选保留）
++        // callback(result.code, result.data || {});
++    }
++}
++```
++
++---
++
++## 4. 回归测试验证
++
++### 测试用例 1: 金币足够创建房间成功
++
++```javascript
++// 输入
++const player = { _gold: 1000, name: "TestPlayer" };
++const roomInfo = { rate: 1, bottom: 10 };
++const configStub = { createRoomConfig: { 1: { needCostGold: 100 } } };
++
++// 期望结果
++- 回调 code === 0
++- data.roomid 存在且非空
++- data.rate === 1
++- _room_info.length === 1
++```
++
++### 测试用例 2: 金币不足创建房间失败
++
++```javascript
++// 输入
++const player = { _gold: 50, name: "PoorPlayer" };
++const roomInfo = { rate: 1, bottom: 10 };
++
++// 期望结果
++- 回调 code === -1
++- 回调 msg === "金币不足"
++- _room_info.length === 0 (无幽灵房间)
++```
++
++### 测试用例 3: 加入不存在的房间
++
++```javascript
++// 输入
++const player = { _gold: 500, name: "TestPlayer" };
++const data = { roomid: "invalid_room_123" };
++
++// 期望结果
++- 回调 code === -3
++- 回调 msg 包含 "invalid_room_123"
++```
++
++---
++
++## 错误码定义
++
++| 错误码 | 说明 |
++|--------|------|
++| 0 | 成功 |
++| -1 | 金币不足 |
++| -2 | 参数错误 |
++| -3 | 未找到房间 |
+diff --git a/player.js b/player.js
+new file mode 100644
+index 0000000..fb676b1
+--- /dev/null
++++ b/player.js
+@@ -0,0 +1,11 @@
++function Player(playInfo, socket, callindex, manager) {
++    return {
++        _gold: playInfo.gold || 0,
++        socket: socket,
++        callindex: callindex,
++        manager: manager,
++        name: playInfo.name || "Unknown"
++    };
++}
++
++module.exports = Player;
+diff --git a/room.js b/room.js
+new file mode 100644
+index 0000000..ec954f6
+--- /dev/null
++++ b/room.js
+@@ -0,0 +1,16 @@
++function Room(roomInfo, owner) {
++    return {
++        room_id: roomInfo.roomid || Math.random().toString(36).substring(7),
++        bottom: roomInfo.bottom || 10,
++        rate: roomInfo.rate,
++        owner: owner,
++        players: [],
++        gold: 0,
++        
++        jion_player: function(player) {
++            this.players.push(player);
++        }
++    };
++}
++
++module.exports = Room;
+diff --git a/room_manager.js b/room_manager.js
+new file mode 100644
+index 0000000..19124a2
+--- /dev/null
++++ b/room_manager.js
+@@ -0,0 +1,100 @@
++const Player = require("./player.js")
++const Room = require("./room.js")
++const config = require("../defines.js")
++
++var _player_list = []
++var _room_info = []
++
++exports.create_player = function(playInfo, socket, callindex) {
++    var player = Player(playInfo, socket, callindex, this)
++    _player_list.push(player)
++}
++
++exports.create_room = function(roomInfo, own_player, callback) {
++    if (!own_player || !roomInfo || !roomInfo.rate) {
++        if (callback) {
++            callback({ code: -2, msg: "参数错误" })
++        }
++        return
++    }
++
++    var needglobal = config.createRoomConfig[roomInfo.rate]?.needCostGold || 0
++    console.log("[create_room] needCostGold:" + needglobal + ", playerGold:" + own_player._gold)
++
++    if (own_player._gold < needglobal) {
++        console.log("[create_room] 金币不足，拒绝创建房间")
++        if (callback) {
++            callback({ code: -1, msg: "金币不足" })
++        }
++        return
++    }
++
++    var room = Room(roomInfo, own_player)
++    _room_info.push(room)
++    console.log("[create_room] 房间已创建，room_id:" + room.room_id)
++
++    room.jion_player(own_player)
++    if (callback) {
++        callback({
++            code: 0,
++            msg: "创建成功",
++            room: room,
++            data: {
++                roomid: room.room_id,
++                bottom: room.bottom,
++                rate: roomInfo.rate
++            }
++        })
++    }
++}
++
++exports.join_room = function(data, player, callback) {
++    if (!data || !data.roomid || !player) {
++        console.log("[join_room] 参数错误")
++        if (callback) {
++            callback({ code: -2, msg: "参数错误" })
++        }
++        return
++    }
++
++    console.log("[join_room] 尝试加入房间:" + data.roomid)
++
++    for (var i = 0; i < _room_info.length; ++i) {
++        if (_room_info[i].room_id === data.roomid) {
++            console.log("[join_room] 找到房间:" + data.roomid + ", 玩家加入")
++            _room_info[i].jion_player(player)
++            if (callback) {
++                var resp = {
++                    code: 0,
++                    msg: "加入成功",
++                    room: _room_info[i],
++                    data: {
++                        roomid: _room_info[i].room_id,
++                        bottom: _room_info[i].bottom,
++                        rate: _room_info[i].rate
++                    }
++                }
++                if (_room_info[i].gold !== undefined) {
++                    resp.data.gold = _room_info[i].gold
++                }
++                callback(resp)
++            }
++            return
++        }
++    }
++
++    console.log("[join_room] 未找到房间:" + data.roomid)
++    if (callback) {
++        callback({ code: -3, msg: "未找到房间:" + data.roomid })
++    }
++}
++
++exports.jion_room = exports.join_room
++
++exports.get_room_count = function() {
++    return _room_info.length
++}
++
++exports.clear_rooms = function() {
++    _room_info = []
++}
+diff --git a/room_manager.test.js b/room_manager.test.js
+new file mode 100644
+index 0000000..2e135f7
+--- /dev/null
++++ b/room_manager.test.js
+@@ -0,0 +1,82 @@
++const RoomManager = require('./room_manager.js');
++const Player = require('./player.js');
++
++describe('RoomManager 房间管理模块测试', () => {
++    
++    beforeEach(() => {
++        RoomManager.clear_rooms();
++    });
++
++    test('测试用例1: 金币足够的玩家创建房间成功', () => {
++        // 准备测试数据
++        const player = Player({ name: "测试玩家", gold: 1000 }, null, 1);
++        const roomInfo = { rate: 1, bottom: 10 };
++        
++        // 执行测试
++        let callbackResult = null;
++        RoomManager.create_room(roomInfo, player, (result) => {
++            callbackResult = result;
++        });
++
++        // 验证结果
++        expect(callbackResult).not.toBeNull();
++        expect(callbackResult.code).toBe(0);
++        expect(callbackResult.data.roomid).toBeDefined();
++        expect(callbackResult.data.rate).toBe(1);
++        expect(RoomManager.get_room_count()).toBe(1);
++    });
++
++    test('测试用例2: 金币不足的玩家创建房间失败', () => {
++        // 准备测试数据
++        const player = Player({ name: "穷玩家", gold: 50 }, null, 2);
++        const roomInfo = { rate: 1, bottom: 10 };
++        
++        // 执行测试
++        let callbackResult = null;
++        RoomManager.create_room(roomInfo, player, (result) => {
++            callbackResult = result;
++        });
++
++        // 验证结果
++        expect(callbackResult).not.toBeNull();
++        expect(callbackResult.code).toBe(-1);
++        expect(callbackResult.msg).toBe("金币不足");
++        expect(RoomManager.get_room_count()).toBe(0);
++    });
++
++    test('测试用例3: 加入不存在的房间', () => {
++        // 准备测试数据
++        const player = Player({ name: "测试玩家", gold: 500 }, null, 3);
++        
++        // 执行测试
++        let callbackResult = null;
++        RoomManager.join_room({ roomid: "不存在的房间123" }, player, (result) => {
++            callbackResult = result;
++        });
++
++        // 验证结果
++        expect(callbackResult).not.toBeNull();
++        expect(callbackResult.code).toBe(-3);
++        expect(callbackResult.msg).toContain("不存在的房间123");
++    });
++
++    test('向后兼容: jion_room 别名应正常工作', () => {
++        const player = Player({ name: "兼容测试", gold: 500 }, null, 4);
++        
++        let callbackResult = null;
++        RoomManager.jion_room({ roomid: "test_room" }, player, (result) => {
++            callbackResult = result;
++        });
++
++        expect(callbackResult.code).toBe(-3);
++    });
++
++    test('参数校验: 缺少 player 参数应返回错误', () => {
++        let callbackResult = null;
++        RoomManager.create_room({ rate: 1 }, null, (result) => {
++            callbackResult = result;
++        });
++
++        expect(callbackResult.code).toBe(-2);
++    });
++});
+diff --git a/room_manager_fixed.js b/room_manager_fixed.js
+new file mode 100644
+index 0000000..eeb6f2c
+--- /dev/null
++++ b/room_manager_fixed.js
+@@ -0,0 +1,98 @@
++const Player = require("./player.js")
++const Room = require("./room.js")
++const config = require("../defines.js")
++
++var _player_list = []
++var _room_info = []
++
++exports.create_player = function(playInfo, socket, callindex) {
++    var player = Player(playInfo, socket, callindex, this)
++    _player_list.push(player)
++}
++
++exports.create_room = function(roomInfo, own_player, callback) {
++    if (!own_player || !roomInfo || !roomInfo.rate) {
++        if (callback) {
++            callback({ code: -2, msg: "参数错误" })
++        }
++        return
++    }
++
++    var needglobal = config.createRoomConfig[roomInfo.rate]?.needCostGold || 0
++    console.log("[create_room] needCostGold:" + needglobal + ", playerGold:" + own_player._gold)
++
++    if (own_player._gold < needglobal) {
++        console.log("[create_room] 金币不足，拒绝创建房间")
++        if (callback) {
++            callback({ code: -1, msg: "金币不足" })
++        }
++        return
++    }
++
++    var room = Room(roomInfo, own_player)
++    _room_info.push(room)
++    console.log("[create_room] 房间已创建，room_id:" + room.room_id)
++
++    room.jion_player(own_player)
++    if (callback) {
++        callback({
++            code: 0,
++            msg: "创建成功",
++            room: room,
++            data: {
++                roomid: room.room_id,
++                bottom: room.bottom,
++                rate: roomInfo.rate
++            }
++        })
++    }
++}
++
++exports.join_room = function(data, player, callback) {
++    if (!data || !data.roomid || !player) {
++        console.log("[join_room] 参数错误")
++        if (callback) {
++            callback({ code: -2, msg: "参数错误" })
++        }
++        return
++    }
++
++    console.log("[join_room] 尝试加入房间:" + data.roomid)
++
++    for (var i = 0; i < _room_info.length; ++i) {
++        if (_room_info[i].room_id === data.roomid) {
++            console.log("[join_room] 找到房间:" + data.roomid + ", 玩家加入")
++            _room_info[i].jion_player(player)
++            if (callback) {
++                var resp = {
++                    code: 0,
++                    msg: "加入成功",
++                    room: _room_info[i],
++                    data: {
++                        roomid: _room_info[i].room_id,
++                        bottom: _room_info[i].bottom,
++                        rate: _room_info[i].rate
++                    }
++                }
++                if (_room_info[i].gold !== undefined) {
++                    resp.data.gold = _room_info[i].gold
++                }
++                callback(resp)
++            }
++            return
++        }
++    }
++
++    console.log("[join_room] 未找到房间:" + data.roomid)
++    if (callback) {
++        callback({ code: -3, msg: "未找到房间:" + data.roomid })
++    }
++}
++
++exports.get_room_count = function() {
++    return _room_info.length
++}
++
++exports.clear_rooms = function() {
++    _room_info = []
++}
+diff --git a/test_room_manager.js b/test_room_manager.js
+new file mode 100644
+index 0000000..7b4b1f7
+--- /dev/null
++++ b/test_room_manager.js
+@@ -0,0 +1,89 @@
++const RoomManager = require('./room_manager_fixed.js');
++const Player = require('./player.js');
++
++function test1() {
++    console.log("\n=== 测试用例1：金币足够的玩家创建房间成功 ===");
++    RoomManager.clear_rooms();
++    
++    const player1 = Player({ name: "张三", gold: 1000 }, null, 1);
++    const roomInfo = { rate: 1, bottom: 10 };
++    
++    RoomManager.create_room(roomInfo, player1, (result) => {
++        console.log("回调结果:", result);
++        if (result.code === 0 && result.data.roomid && result.data.rate === 1) {
++            console.log("✅ 测试用例1通过");
++        } else {
++            console.log("❌ 测试用例1失败");
++        }
++    });
++}
++
++function test2() {
++    console.log("\n=== 测试用例2：金币不足的玩家创建房间失败 ===");
++    RoomManager.clear_rooms();
++    
++    const player2 = Player({ name: "李四", gold: 50 }, null, 2);
++    const roomInfo = { rate: 1, bottom: 10 };
++    
++    RoomManager.create_room(roomInfo, player2, (result) => {
++        console.log("回调结果:", result);
++        const roomCount = RoomManager.get_room_count();
++        if (result.code === -1 && result.msg === "金币不足" && roomCount === 0) {
++            console.log("✅ 测试用例2通过");
++        } else {
++            console.log("❌ 测试用例2失败，当前房间数量:", roomCount);
++        }
++    });
++}
++
++function test3() {
++    console.log("\n=== 测试用例3：加入不存在的房间 ===");
++    RoomManager.clear_rooms();
++    
++    const player3 = Player({ name: "王五", gold: 500 }, null, 3);
++    
++    RoomManager.join_room({ roomid: "不存在的房间ID" }, player3, (result) => {
++        console.log("回调结果:", result);
++        if (result.code === -3 && result.msg.includes("不存在的房间ID")) {
++            console.log("✅ 测试用例3通过");
++        } else {
++            console.log("❌ 测试用例3失败");
++        }
++    });
++}
++
++function test4() {
++    console.log("\n=== 测试用例4：并发创建房间（模拟幽灵房间） ===");
++    RoomManager.clear_rooms();
++    
++    const poorPlayer = Player({ name: "穷玩家", gold: 50 }, null, 4);
++    let successCount = 0;
++    let failCount = 0;
++    
++    for (let i = 0; i < 10; i++) {
++        setTimeout(() => {
++            RoomManager.create_room({ rate: 1 }, poorPlayer, (result) => {
++                if (result.code === 0) {
++                    successCount++;
++                } else {
++                    failCount++;
++                }
++                
++                if (successCount + failCount === 10) {
++                    const finalRoomCount = RoomManager.get_room_count();
++                    console.log(`并发测试完成: 成功${successCount}, 失败${failCount}, 剩余房间${finalRoomCount}`);
++                    if (finalRoomCount === 0) {
++                        console.log("✅ 测试用例4通过，无幽灵房间残留");
++                    } else {
++                        console.log("❌ 测试用例4失败，存在幽灵房间");
++                    }
++                }
++            });
++        }, i * 10);
++    }
++}
++
++test1();
++setTimeout(test2, 200);
++setTimeout(test3, 400);
++setTimeout(test4, 600);
